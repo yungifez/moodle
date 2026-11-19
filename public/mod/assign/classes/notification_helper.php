@@ -754,15 +754,28 @@ class notification_helper {
     }
 
     /**
-     * Check the user's latest individual or group submission.
+     * Check whether the user has completed their submission requirements.
      *
      * @param \assign $assignmentobj The assignment object.
      * @param int $userid The user id.
-     * @return bool Whether the relevant submission has been submitted for grading.
+     * @return bool Whether the user or their group has already submitted.
      */
     protected static function has_user_submitted(\assign $assignmentobj, int $userid): bool {
-        if ($assignmentobj->get_instance()->teamsubmission) {
-            $submission = $assignmentobj->get_group_submission($userid, 0, false);
+        $instance = $assignmentobj->get_instance();
+        if ($instance->teamsubmission) {
+            $groupsubmission = $assignmentobj->get_group_submission($userid, 0, false);
+            if (!$groupsubmission) {
+                return false;
+            }
+            if ($groupsubmission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
+                return true;
+            }
+            if (!$instance->requireallteammemberssubmit) {
+                return false;
+            }
+
+            // A confirmed member needs no reminder while the remaining members confirm this attempt.
+            $submission = $assignmentobj->get_user_submission($userid, false, $groupsubmission->attemptnumber);
         } else {
             $submission = $assignmentobj->get_user_submission($userid, false);
         }

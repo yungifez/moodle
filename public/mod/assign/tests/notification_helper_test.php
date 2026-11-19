@@ -883,13 +883,61 @@ final class notification_helper_test extends \advanced_testcase {
         $this->assertTrue($assignment->submit_for_grading((object) [], []));
         $this->assertSame(ASSIGN_SUBMISSION_STATUS_DRAFT, $assignment->get_group_submission($teammate->id, 0, false)->status);
         $users = notification_helper::get_users_within_assignment($assignmentid, $type);
-        $this->assertContains($teammate->id, array_column($users, 'id'));
+        $this->assertEqualsCanonicalizing([$teammate->id, $otherstudent->id], array_column($users, 'id'));
 
         $this->setUser($teammate);
         $this->assertTrue($assignment->submit_for_grading((object) [], []));
         $this->assertSame(ASSIGN_SUBMISSION_STATUS_SUBMITTED, $assignment->get_group_submission($teammate->id, 0, false)->status);
         $users = notification_helper::get_users_within_assignment($assignmentid, $type);
         $this->assertEquals([$otherstudent->id], array_values(array_column($users, 'id')));
+    }
+
+    /**
+     * Queued notifications must only remind members who still need to confirm submission.
+     *
+     * @param string $type Notification type.
+     * @param int $dueoffset Due date relative to the current time.
+     * @param string $taskclass Sending task class.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('group_notification_provider')]
+    public function test_queued_notifications_only_remind_unconfirmed_members(
+        string $type,
+        int $dueoffset,
+        string $taskclass,
+    ): void {
+        $this->resetAfterTest();
+        $clock = $this->mock_clock_with_frozen();
+        $sink = $this->redirectMessages();
+        [$assignment, $submitter, $teammate] =
+            $this->create_group_notification_assignment($clock->time() + $dueoffset, true);
+
+        foreach ([$submitter, $teammate] as $student) {
+            $task = new $taskclass();
+            $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $student->id]);
+            $task->set_userid($student->id);
+            \core\task\manager::queue_adhoc_task($task);
+        }
+
+        $this->setUser($submitter);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $sink->clear();
+        $this->runAdhocTasks($taskclass);
+        $messages = $sink->get_messages_by_component('mod_assign');
+        $this->assertCount(1, $messages);
+        $this->assertEquals($teammate->id, reset($messages)->useridto);
+
+        foreach ([$submitter, $teammate] as $student) {
+            $task = new $taskclass();
+            $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $student->id]);
+            $task->set_userid($student->id);
+            \core\task\manager::queue_adhoc_task($task);
+        }
+
+        $this->setUser($teammate);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $sink->clear();
+        $this->runAdhocTasks($taskclass);
+        $this->assertEmpty($sink->get_messages_by_component('mod_assign'));
     }
 
     /**
