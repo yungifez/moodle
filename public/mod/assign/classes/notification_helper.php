@@ -31,7 +31,6 @@ require_once($CFG->dirroot . '/mod/assign/locallib.php');
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 class notification_helper {
-
     /**
      * @var int Due soon time interval of 48 hours.
      */
@@ -250,8 +249,7 @@ class notification_helper {
             }
 
             // Check if the user has submitted already.
-            $submission = $assignmentobj->get_user_submission($user->id, false);
-            if ($submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
+            if (self::has_user_submitted($assignmentobj, $user->id)) {
                 unset($users[$key]);
                 continue;
             }
@@ -381,8 +379,7 @@ class notification_helper {
         }
 
         // Check if the user has submitted already.
-        $submission = $assignmentobj->get_user_submission($userid, false);
-        if ($submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
+        if (self::has_user_submitted($assignmentobj, $userid)) {
             return;
         }
 
@@ -495,8 +492,7 @@ class notification_helper {
         }
 
         // Check if the user has submitted already.
-        $submission = $assignmentobj->get_user_submission($userid, false);
-        if ($submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
+        if (self::has_user_submitted($assignmentobj, $userid)) {
             return;
         }
 
@@ -584,8 +580,7 @@ class notification_helper {
             $assignmentobj = self::get_assignment_data($assignment->id);
 
             // Check if the user has submitted already.
-            $submission = $assignmentobj->get_user_submission($userid, false);
-            if ($submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
+            if (self::has_user_submitted($assignmentobj, $userid)) {
                 continue;
             }
 
@@ -756,6 +751,23 @@ class notification_helper {
             'component' => 'mod_assign',
             'eventtype' => $type,
         ]);
+    }
+
+    /**
+     * Check the user's latest individual or group submission.
+     *
+     * @param \assign $assignmentobj The assignment object.
+     * @param int $userid The user id.
+     * @return bool Whether the relevant submission has been submitted for grading.
+     */
+    protected static function has_user_submitted(\assign $assignmentobj, int $userid): bool {
+        if ($assignmentobj->get_instance()->teamsubmission) {
+            $submission = $assignmentobj->get_group_submission($userid, 0, false);
+        } else {
+            $submission = $assignmentobj->get_user_submission($userid, false);
+        }
+
+        return $submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED;
     }
 
     /**
