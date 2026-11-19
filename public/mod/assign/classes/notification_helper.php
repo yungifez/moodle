@@ -762,22 +762,21 @@ class notification_helper {
      */
     protected static function has_user_submitted(\assign $assignmentobj, int $userid): bool {
         $instance = $assignmentobj->get_instance();
-        if ($instance->teamsubmission) {
-            $groupsubmission = $assignmentobj->get_group_submission($userid, 0, false);
-            if (!$groupsubmission) {
-                return false;
-            }
-            if ($groupsubmission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED) {
-                return true;
-            }
-            if (!$instance->requireallteammemberssubmit) {
-                return false;
-            }
+        $submission = $instance->teamsubmission
+            ? $assignmentobj->get_group_submission($userid, 0, false)
+            : $assignmentobj->get_user_submission($userid, false);
 
-            // A confirmed member needs no reminder while the remaining members confirm this attempt.
-            $submission = $assignmentobj->get_user_submission($userid, false, $groupsubmission->attemptnumber);
-        } else {
-            $submission = $assignmentobj->get_user_submission($userid, false);
+        if (!$submission) {
+            return false;
+        }
+
+        // For an incomplete group, check whether this member has already confirmed the current attempt.
+        if (
+            $instance->teamsubmission
+            && $instance->requireallteammemberssubmit
+            && $submission->status !== ASSIGN_SUBMISSION_STATUS_SUBMITTED
+        ) {
+            $submission = $assignmentobj->get_user_submission($userid, false, $submission->attemptnumber);
         }
 
         return $submission && $submission->status === ASSIGN_SUBMISSION_STATUS_SUBMITTED;
