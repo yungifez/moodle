@@ -33,7 +33,6 @@ use mod_assign\task\send_assignment_overdue_notification_to_user;
  */
 #[\PHPUnit\Framework\Attributes\CoversClass(\mod_assign\notification_helper::class)]
 final class notification_helper_test extends \advanced_testcase {
-
     use task_trait;
 
     /**
@@ -737,6 +736,207 @@ final class notification_helper_test extends \advanced_testcase {
         $this->run_overdue_notification_helper_tasks();
 
         // No new notification should have been sent.
+        $this->assertEmpty($sink->get_messages_by_component('mod_assign'));
+    }
+
+    /**
+     * Notification types, due dates and sending tasks for group submission tests.
+     *
+     * @return array
+     */
+    public static function group_notification_provider(): array {
+        return [
+            'due soon' => [notification_helper::TYPE_DUE_SOON, DAYSECS, send_assignment_due_soon_notification_to_user::class],
+            'overdue' => [notification_helper::TYPE_OVERDUE, -HOURSECS, send_assignment_overdue_notification_to_user::class],
+            'digest' => [notification_helper::TYPE_DUE_DIGEST, WEEKSECS, send_assignment_due_digest_notification_to_user::class],
+        ];
+    }
+
+    /**
+     * Create a draft group submission and a student in another group who still needs to submit.
+     *
+     * @param int $duedate Assignment due date.
+     * @param bool $requireall Whether every member must confirm submission.
+     * @return array Assignment, submitting student, teammate and student in another group.
+     */
+    protected function create_group_notification_assignment(int $duedate, bool $requireall = false): array {
+        $generator = $this->getDataGenerator();
+        $course = $generator->create_course(['enablecompletion' => 0]);
+        $submitter = $generator->create_and_enrol($course, 'student');
+        $teammate = $generator->create_and_enrol($course, 'student');
+        $otherstudent = $generator->create_and_enrol($course, 'student');
+        $group = $generator->create_group(['courseid' => $course->id]);
+        $othergroup = $generator->create_group(['courseid' => $course->id]);
+        $generator->create_group_member(['groupid' => $group->id, 'userid' => $submitter->id]);
+        $generator->create_group_member(['groupid' => $group->id, 'userid' => $teammate->id]);
+        $generator->create_group_member(['groupid' => $othergroup->id, 'userid' => $otherstudent->id]);
+
+        $assignmentgenerator = $generator->get_plugin_generator('mod_assign');
+        $instance = $assignmentgenerator->create_instance([
+            'course' => $course->id,
+            'duedate' => $duedate,
+            'teamsubmission' => 1,
+            'requireallteammemberssubmit' => (int) $requireall,
+            'submissiondrafts' => 1,
+            'sendstudentnotifications' => 0,
+            'assignsubmission_onlinetext_enabled' => 1,
+            'assignsubmission_file_enabled' => 0,
+        ]);
+        [$course, $cm] = get_course_and_cm_from_instance($instance->id, 'assign');
+        $assignment = new \assign(\context_module::instance($cm->id), $cm, $course);
+        $assignmentgenerator->create_submission([
+            'userid' => $submitter->id,
+            'cmid' => $cm->id,
+            'onlinetext' => 'Group assignment submission',
+        ]);
+
+        return [$assignment, $submitter, $teammate, $otherstudent];
+    }
+
+    /**
+     * Exclude a submitted group even when a teammate's individual submission remains a draft.
+     *
+     * @param string $type Notification type.
+     * @param int $dueoffset Due date relative to the current time.
+     * @param string $taskclass Sending task class.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('group_notification_provider')]
+    public function test_submitted_group_is_excluded_from_notifications(string $type, int $dueoffset, string $taskclass): void {
+        $this->resetAfterTest();
+        $clock = $this->mock_clock_with_frozen();
+        [$assignment, $submitter, $teammate, $otherstudent] =
+            $this->create_group_notification_assignment($clock->time() + $dueoffset);
+        $assignmentid = $assignment->get_instance()->id;
+
+        $users = notification_helper::get_users_within_assignment($assignmentid, $type);
+        $this->assertEqualsCanonicalizing(
+            [$submitter->id, $teammate->id, $otherstudent->id],
+            array_column($users, 'id'),
+        );
+
+        $this->setUser($submitter);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $this->assertSame(ASSIGN_SUBMISSION_STATUS_SUBMITTED, $assignment->get_group_submission($teammate->id, 0, false)->status);
+        $this->assertSame(ASSIGN_SUBMISSION_STATUS_DRAFT, $assignment->get_user_submission($teammate->id, false)->status);
+
+        $users = notification_helper::get_users_within_assignment($assignmentid, $type);
+        $this->assertEquals([$otherstudent->id], array_values(array_column($users, 'id')));
+    }
+
+    /**
+     * A queued notification must recheck whether another member has submitted for the group.
+     *
+     * @param string $type Notification type.
+     * @param int $dueoffset Due date relative to the current time.
+     * @param string $taskclass Sending task class.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('group_notification_provider')]
+    public function test_queued_notifications_skip_submitted_group(string $type, int $dueoffset, string $taskclass): void {
+        $this->resetAfterTest();
+        $clock = $this->mock_clock_with_frozen();
+        $sink = $this->redirectMessages();
+        [$assignment, $submitter, $teammate, $otherstudent] =
+            $this->create_group_notification_assignment($clock->time() + $dueoffset);
+
+        $task = new $taskclass();
+        $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $teammate->id]);
+        $task->set_userid($teammate->id);
+        \core\task\manager::queue_adhoc_task($task);
+
+        $this->setUser($submitter);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $sink->clear();
+        $this->runAdhocTasks($taskclass);
+        $this->assertEmpty($sink->get_messages_by_component('mod_assign'));
+
+        // A student in another group must still receive the reminder.
+        $task = new $taskclass();
+        $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $otherstudent->id]);
+        $task->set_userid($otherstudent->id);
+        \core\task\manager::queue_adhoc_task($task);
+        $this->runAdhocTasks($taskclass);
+        $messages = $sink->get_messages_by_component('mod_assign');
+        $this->assertCount(1, $messages);
+        $this->assertEquals($otherstudent->id, reset($messages)->useridto);
+    }
+
+    /**
+     * Keep reminders for a group whose required member confirmations are incomplete.
+     *
+     * @param string $type Notification type.
+     * @param int $dueoffset Due date relative to the current time.
+     * @param string $taskclass Sending task class.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('group_notification_provider')]
+    public function test_group_notifications_require_all_member_confirmations(
+        string $type,
+        int $dueoffset,
+        string $taskclass,
+    ): void {
+        $this->resetAfterTest();
+        $clock = $this->mock_clock_with_frozen();
+        [$assignment, $submitter, $teammate, $otherstudent] =
+            $this->create_group_notification_assignment($clock->time() + $dueoffset, true);
+        $assignmentid = $assignment->get_instance()->id;
+
+        $this->setUser($submitter);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $this->assertSame(ASSIGN_SUBMISSION_STATUS_DRAFT, $assignment->get_group_submission($teammate->id, 0, false)->status);
+        $users = notification_helper::get_users_within_assignment($assignmentid, $type);
+        $this->assertEqualsCanonicalizing([$teammate->id, $otherstudent->id], array_column($users, 'id'));
+
+        $this->setUser($teammate);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $this->assertSame(ASSIGN_SUBMISSION_STATUS_SUBMITTED, $assignment->get_group_submission($teammate->id, 0, false)->status);
+        $users = notification_helper::get_users_within_assignment($assignmentid, $type);
+        $this->assertEquals([$otherstudent->id], array_values(array_column($users, 'id')));
+    }
+
+    /**
+     * Queued notifications must only remind members who still need to confirm submission.
+     *
+     * @param string $type Notification type.
+     * @param int $dueoffset Due date relative to the current time.
+     * @param string $taskclass Sending task class.
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('group_notification_provider')]
+    public function test_queued_notifications_only_remind_unconfirmed_members(
+        string $type,
+        int $dueoffset,
+        string $taskclass,
+    ): void {
+        $this->resetAfterTest();
+        $clock = $this->mock_clock_with_frozen();
+        $sink = $this->redirectMessages();
+        [$assignment, $submitter, $teammate] =
+            $this->create_group_notification_assignment($clock->time() + $dueoffset, true);
+
+        foreach ([$submitter, $teammate] as $student) {
+            $task = new $taskclass();
+            $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $student->id]);
+            $task->set_userid($student->id);
+            \core\task\manager::queue_adhoc_task($task);
+        }
+
+        $this->setUser($submitter);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $sink->clear();
+        $this->runAdhocTasks($taskclass);
+        $messages = $sink->get_messages_by_component('mod_assign');
+        $this->assertCount(1, $messages);
+        $this->assertEquals($teammate->id, reset($messages)->useridto);
+
+        foreach ([$submitter, $teammate] as $student) {
+            $task = new $taskclass();
+            $task->set_custom_data(['assignmentid' => $assignment->get_instance()->id, 'userid' => $student->id]);
+            $task->set_userid($student->id);
+            \core\task\manager::queue_adhoc_task($task);
+        }
+
+        $this->setUser($teammate);
+        $this->assertTrue($assignment->submit_for_grading((object) [], []));
+        $sink->clear();
+        $this->runAdhocTasks($taskclass);
         $this->assertEmpty($sink->get_messages_by_component('mod_assign'));
     }
 
